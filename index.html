@@ -1,0 +1,286 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>VR screen (YouTube)</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;color:#eee;font-family:system-ui,sans-serif}
+  #ui{position:fixed;inset:0;z-index:20;background:#000;display:flex;flex-direction:column;gap:16px;align-items:center;justify-content:center;text-align:center;padding:0 24px}
+  #ui input{font:inherit;width:100%;max-width:420px;padding:10px;border-radius:8px;border:1px solid #555;background:#111;color:#eee}
+  #ui button{font:inherit;font-size:18px;padding:12px 32px;border:0;border-radius:8px;background:#3ddc97;color:#000}
+  #vr{display:flex;height:100%}
+  .eye{position:relative;width:50vw;height:100%;overflow:hidden}
+  #vr.one .eye{width:100vw}
+  #vr.one .eye:nth-child(2){display:none}
+  .eye video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  .scr{position:absolute;z-index:1}
+  .cut,.ray{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+  .cut{z-index:2}
+  .ray{z-index:3;color:#fff}
+  .ray line{stroke:currentColor;stroke-width:3;stroke-opacity:.7}
+  .ray circle{fill:currentColor}
+  .bar{position:absolute;z-index:4;top:8px;right:8px;display:flex;gap:6px}
+  #vr:not(.one) .bar{right:auto;left:50%;transform:translateX(-50%)}
+  .bar button{font:inherit;font-size:14px;padding:8px 12px;border:0;border-radius:8px;background:rgba(0,0,0,.6);color:#fff}
+.hint{position:absolute;z-index:4;top:50%;left:50%;transform:translate(-50%,-50%);font-size:22px;color:#ff6;pointer-events:none}
+.scr i{position:absolute;width:26px;height:26px;margin:-13px;border-radius:50%;background:#3ddc97;border:3px solid #fff;box-sizing:border-box;pointer-events:none}
+</style>
+
+<div id="ui">
+  <div>Paste a YouTube link, then tap Start. (v7)</div>
+  <input id="link" type="url" placeholder="https://youtube.com/watch?v=...">
+  <button id="go">Start</button>
+  <div id="note" style="font-size:14px;color:#9ab"></div>
+</div>
+<div id="vr" class="one"><div class="eye"></div><div class="eye"></div></div>
+<div id="msg" style="position:fixed;top:8px;left:8px;z-index:30;font-size:14px;color:#ff6;pointer-events:none"></div>
+
+<script>
+const apiReady = new Promise(r => window.onYouTubeIframeAPIReady = r);
+</script>
+<script src="https://www.youtube.com/iframe_api"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script>
+const eyes = [...document.querySelectorAll('.eye')], vrEl = document.getElementById('vr'), msg = document.getElementById('msg');
+const D = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const FOV = 65 * Math.PI / 180;      // camera horizontal field of view: tweak if the pinned screen drifts against the room
+const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[0,17],[17,18],[18,19],[19,20]];
+
+const BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/';
+const FILES = ['hands.binarypb', 'hands_solution_packed_assets_loader.js', 'hands_solution_packed_assets.data',
+               'hands_solution_simd_wasm_bin.js', 'hands_solution_simd_wasm_bin.wasm', 'hand_landmark_lite.tflite'];
+
+let vr = false, room = true, gyro = false, loading = true, id, L, R, A;
+let pw, ph, ox, oy, cw, ch, f;       // pane size, camera image placement, focal length (px)
+let sx = .5, sy = .5, sw = .6;       // screen centre + width, as fractions of the pane
+let lastP = null, lastD = 0, t0 = 0, moved = 0, grabD = 0, sw0 = 1, rotCss = 0;
+let hands;
+let M = [1, 0, 0, 0, 1, 0, 0, 0, 1]; // phone → world rotation from the gyro
+const cams = [], scr = [], holders = [], cuts = [], rays = [], hints = [];
+
+const size = () => {
+  pw = Math.round(innerWidth / (vr ? 2 : 1)); ph = innerHeight;
+  const v = cams[0], k = Math.max(pw / v.videoWidth, ph / v.videoHeight);
+  cw = v.videoWidth * k; ch = v.videoHeight * k;
+  ox = (pw - cw) / 2; oy = (ph - ch) / 2;
+  f = (cw / 2) / Math.tan(FOV / 2);
+};
+
+/* ---- head tracking (gyro) ---- */
+const ang = () => (screen.orientation ? screen.orientation.angle : window.orientation || 0) * Math.PI / 180;
+const toView = v => {                // world direction → camera view (x right, y up, -z forward)
+  const d = [M[0]*v[0] + M[3]*v[1] + M[6]*v[2], M[1]*v[0] + M[4]*v[1] + M[7]*v[2], M[2]*v[0] + M[5]*v[1] + M[8]*v[2]];
+  const o = ang(), c = Math.cos(o), s = Math.sin(o);
+  return [d[0]*c - d[1]*s, d[0]*s + d[1]*c, d[2]];
+};
+const toWorld = v => {
+  const o = ang(), c = Math.cos(o), s = Math.sin(o);
+  const x = v[0]*c + v[1]*s, y = -v[0]*s + v[1]*c, z = v[2];
+  return [M[0]*x + M[1]*y + M[2]*z, M[3]*x + M[4]*y + M[5]*z, M[6]*x + M[7]*y + M[8]*z];
+};
+addEventListener('deviceorientation', e => {
+  if (e.alpha == null) return;
+  gyro = true;
+  const r = Math.PI / 180, a = e.alpha * r, b = e.beta * r, g = e.gamma * r;
+  const ca = Math.cos(a), sa = Math.sin(a), cb = Math.cos(b), sb = Math.sin(b), cg = Math.cos(g), sg = Math.sin(g);
+  M = [ca*cg - sa*sb*sg, -sa*cb, ca*sg + cg*sa*sb,
+       sa*cg + ca*sb*sg,  ca*cb, sa*sg - ca*cg*sb,
+       -cb*sg,            sb,    cb*cg];
+});
+const anchor = () => A = toWorld([(sx * pw - pw / 2) / f, -(sy * ph - ph / 2) / f, -1]);
+
+/* ---- draw the screen every frame ---- */
+function frame() {
+  size();
+  let hide = false, roll = 0, hint = '';
+  if (room && gyro && (loading || !A)) { sx = .5; sy = .5; anchor(); }   // stay in front of you until tracking is ready
+  if (room && A) {
+    const s = toView(A), u = toView([0, 0, 1]);
+    if (s[2] < -.05) { sx = (pw / 2 + f * s[0] / -s[2]) / pw; sy = (ph / 2 - f * s[1] / -s[2]) / ph; }
+    else hide = true;
+    hint = hide ? (s[0] < 0 ? '← screen' : 'screen →') : sx < 0 ? '← screen' : sx > 1 ? 'screen →' : sy < 0 ? '↑ screen' : sy > 1 ? '↓ screen' : '';
+    roll = Math.atan2(-u[0], u[1]);
+  }
+  rotCss = -roll;
+  hints.forEach(h => h.textContent = hint);
+  scr.forEach(e => {
+    e.style.display = hide ? 'none' : '';
+    e.style.width = sw * pw + 'px';
+    e.style.height = sw * pw * 9 / 16 + 'px';
+    e.style.left = (sx - sw / 2) * pw + 'px';
+    e.style.top = sy * ph - sw * pw * 9 / 32 + 'px';
+    e.style.transform = 'rotate(' + -roll + 'rad)';
+  });
+  requestAnimationFrame(frame);
+}
+
+/* ---- buttons (touch, or quick pinch with the hand ray) ---- */
+document.addEventListener('click', async e => {
+  const a = e.target.dataset && e.target.dataset.a;
+  if (a == 'center') { sx = .5; sy = .5; anchor(); }
+  if (a == 'room') {
+    room = !room; if (room) anchor();
+    document.querySelectorAll('[data-a=room]').forEach(b => b.textContent = room ? 'Follow view' : 'Fix in room');
+  }
+  if (a == 'vr') {
+    vr = !vr; vrEl.classList.toggle('one', !vr);
+    document.querySelectorAll('[data-a=vr]').forEach(b => b.textContent = vr ? 'Normal view' : 'VR view');
+    if (vr) {
+      R = R || await makePlayer(holders[1]);
+      R.mute(); R.seekTo(L.getCurrentTime(), true);
+      L.getPlayerState() == 1 ? R.playVideo() : R.pauseVideo();
+    } else if (R) R.pauseVideo();
+  }
+});
+
+const makePlayer = h => new Promise(res => {
+  const p = new YT.Player(h, {
+    width: '100%', height: '100%', videoId: id,
+    playerVars: { controls: 0, playsinline: 1, rel: 0, disablekb: 1 },
+    events: { onReady: () => res(p) }
+  });
+});
+const sync = () => {                 // right eye follows the left (not possible for live streams)
+  if (!vr || !R || !L.getDuration()) return;
+  const t = L.getCurrentTime();
+  if (Math.abs(R.getCurrentTime() - t) > .3) R.seekTo(t, true);
+};
+const mid = () => ({ x: sx * pw, y: sy * ph });
+const nearCorner = c => [[-1, -1], [1, -1], [-1, 1], [1, 1]].some(([i, j]) => {   // is the cursor on a corner handle?
+  const x = i * sw * pw / 2, y = j * sw * pw * 9 / 32, k = Math.cos(rotCss), n = Math.sin(rotCss);
+  return D(c, { x: sx * pw + x * k - y * n, y: sy * ph + x * n + y * k }) < 90;
+});
+const click = c => {
+  const el = document.elementFromPoint(c.x, c.y);
+  if (el && el.dataset.a) el.click();
+  else if (Math.abs(c.x - sx * pw) < sw * pw / 2 && Math.abs(c.y - sy * ph) < sw * pw * 9 / 32) {
+    const playing = L.getPlayerState() == 1;
+    (vr ? [L, R] : [L]).forEach(p => playing ? p.pauseVideo() : p.playVideo());
+  }
+};
+
+/* ---- hand tracking model: starts downloading as soon as the page opens ---- */
+const note = document.getElementById('note');
+const handsReady = (async () => {
+  hands = new Hands({ locateFile: n => BASE + n });
+  hands.setOptions({ maxNumHands: 2, modelComplexity: 0, minDetectionConfidence: .7, minTrackingConfidence: .6 });
+  hands.onResults(onHands);
+  let got = 0;
+  await Promise.all(FILES.map(async n => {
+    const rd = (await fetch(BASE + n)).body.getReader();
+    for (;;) {
+      const { done, value } = await rd.read();
+      if (done) break;
+      got += value.length;
+      note.textContent = 'Hand tracking: downloading ' + (got / 1e6).toFixed(1) + ' MB';
+    }
+  }));
+  note.textContent = 'Hand tracking: starting…';
+  await hands.initialize();
+  note.textContent = 'Hand tracking: ready ✓';
+})();
+handsReady.catch(e => note.textContent = 'Hand tracking error: ' + e);
+
+/* ---- start ---- */
+document.getElementById('go').onclick = async () => { try {
+  msg.textContent = 'Starting…';
+  document.documentElement.requestFullscreen().then(() => screen.orientation.lock('landscape')).catch(() => {});
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: 'environment', width: 960, height: 540 }
+  });
+  id = document.getElementById('link').value.match(/(?:v=|youtu\.be\/|shorts\/|live\/)([\w-]{11})/)[1];
+  document.getElementById('ui').remove();
+
+  eyes.forEach(e => {
+    const v = document.createElement('video');
+    v.srcObject = stream;
+    v.muted = v.playsInline = v.autoplay = true;
+    const s = document.createElement('div'); s.className = 'scr';
+    const h = document.createElement('div'); s.append(h);
+    s.insertAdjacentHTML('beforeend', '<i style="left:0;top:0"></i><i style="left:100%;top:0"></i><i style="left:0;top:100%"></i><i style="left:100%;top:100%"></i>');
+    const c = document.createElement('canvas'); c.className = 'cut';
+    e.append(v, s, c);
+    e.insertAdjacentHTML('beforeend',
+      '<svg class="ray">' + '<g style="display:none"><line/><circle r="12"/></g>'.repeat(2) + '</svg>' +
+      '<div class="hint"></div><div class="bar"><button data-a="vr">VR view</button><button data-a="center">Recenter</button><button data-a="room">Follow view</button></div>');
+    cams.push(v); scr.push(s); holders.push(h); cuts.push(c); rays.push(e.querySelector('.ray')); hints.push(e.querySelector('.hint'));
+  });
+  await cams[0].play();
+
+  await apiReady;
+  L = await makePlayer(holders[0]);
+  setTimeout(() => L.playVideo(), 30000);       // fallback: start the video even if tracking is slow
+  setInterval(sync, 1000);
+  size(); frame();
+
+  msg.textContent = 'Starting hand tracking…';
+  await handsReady;
+  L.playVideo();                                // video starts once tracking is ready
+  for (;;) await hands.send({ image: cams[0] });
+} catch (e) { msg.textContent = 'Error: ' + e; if (L) L.playVideo(); } };
+
+/* ---- hands: ray from the fingertip, pinch to click / drag / resize, hand cut-out over the screen ---- */
+function onHands(r) {
+  msg.textContent = '';
+  loading = false;
+  size();
+  const P = l => ({ x: ox + l.x * cw, y: oy + l.y * ch });
+  const H = (r.multiHandLandmarks || []).map(l => l.map(P));
+
+  rays.forEach(s => [...s.children].forEach(g => g.style.display = 'none'));
+  const pinch = [];
+  H.forEach((l, i) => {
+    const palm = D(l[0], l[9]), len = D(l[0], l[5]);
+    const pinched = D(l[4], l[8]) < .35 * palm;
+    const c = { x: l[5].x + (l[5].x - l[0].x) / len * palm * 2, y: l[5].y + (l[5].y - l[0].y) / len * palm * 2 };
+    rays.forEach(s => {
+      const g = s.children[i], [ln, ci] = g.children;
+      g.style.display = 'inline'; g.style.color = pinched ? '#3ddc97' : '#fff';
+      ln.setAttribute('x1', l[8].x); ln.setAttribute('y1', l[8].y);
+      ln.setAttribute('x2', c.x);    ln.setAttribute('y2', c.y);
+      ci.setAttribute('cx', c.x);    ci.setAttribute('cy', c.y);
+    });
+    if (pinched) pinch.push({ c, t: l[8] });
+  });
+
+  cuts.forEach((cv, n) => {          // real hand drawn on top of the virtual screen
+    if (!vr && n) return;
+    if (cv.width != pw || cv.height != ph) { cv.width = pw; cv.height = ph; }
+    const g = cv.getContext('2d');
+    g.globalCompositeOperation = 'source-over';
+    g.clearRect(0, 0, pw, ph);
+    if (!H.length) return;
+    g.drawImage(cams[0], ox, oy, cw, ch);
+    g.globalCompositeOperation = 'destination-in';
+    g.lineCap = g.lineJoin = 'round';
+    g.lineWidth = D(H[0][0], H[0][9]) * .45;
+    g.beginPath();
+    H.forEach(l => BONES.forEach(([i, j]) => { g.moveTo(l[i].x, l[i].y); g.lineTo(l[j].x, l[j].y); }));
+    g.stroke();
+    g.globalCompositeOperation = 'source-over';   // skeleton on top
+    g.strokeStyle = '#3df'; g.fillStyle = '#fff'; g.lineWidth = 3;
+    g.beginPath();
+    H.forEach(l => BONES.forEach(([i, j]) => { g.moveTo(l[i].x, l[i].y); g.lineTo(l[j].x, l[j].y); }));
+    g.stroke();
+    H.forEach(l => l.forEach(q => { g.beginPath(); g.arc(q.x, q.y, 5, 0, 7); g.fill(); }));
+  });
+
+  const [a, b] = pinch;
+  if (pinch.length == 2) {                       // two-hand pinch: resize
+    const d = D(a.t, b.t);
+    if (lastD) sw *= d / lastD;
+    lastD = d; lastP = null; grabD = 0;
+  } else if (pinch.length == 1) {                // one-hand pinch: drag, or resize if a corner is grabbed
+    if (lastP) {
+      if (grabD) { sw = sw0 * D(a.c, mid()) / grabD; moved = 1e9; }
+      else { sx += (a.c.x - lastP.x) / pw; sy += (a.c.y - lastP.y) / ph; moved += D(a.c, lastP); if (room) anchor(); }
+    } else {
+      t0 = Date.now(); moved = lastD ? 1e9 : 0;
+      grabD = nearCorner(a.c) ? D(a.c, mid()) : 0; sw0 = sw;
+    }
+    lastP = a.c; lastD = 0;
+  } else {                                       // released: quick pinch = click
+    if (lastP && Date.now() - t0 < 400 && moved < 30) click(lastP);
+    lastP = null; lastD = 0; grabD = 0;
+  }
+}
+</script>
